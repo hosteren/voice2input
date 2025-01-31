@@ -28,7 +28,7 @@ A modern speech-to-text application that transcribes your voice and automaticall
 
 1. Clone this repository:
 ```bash
-git clone https://github.com/trollek/voice2input.git
+git clone https://github.com/hosteren/voice2input.git
 cd voice2input
 ```
 
