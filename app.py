@@ -12,11 +12,12 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                             QPushButton, QLabel, QComboBox, QSystemTrayIcon,
                             QMenu, QDialog, QTabWidget, QGridLayout, QCheckBox,
                             QSpinBox, QLineEdit, QTextEdit)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings, QEvent
 from PyQt6.QtGui import QIcon, QAction
 import pyperclip
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
 from pynput import keyboard as kb
+import threading
 
 WHISPER_MODELS = {
     "Tiny": "openai/whisper-tiny",
@@ -88,42 +89,87 @@ class AudioRecorder(QThread):
         self.audio_data = []
         self.device = None
         self.audio_file = None
+        self._stream = None
+        self.max_recording_size = 1024 * 1024 * 100  # 100MB limit
+        # Add lock for thread safety
+        self._lock = threading.Lock()
 
     def set_device(self, device):
         self.device = device
 
     def run(self):
         try:
-            with sd.InputStream(samplerate=self.sample_rate, channels=1, 
-                              callback=self._audio_callback, device=self.device):
-                while self.recording:
-                    sd.sleep(100)
+            # Create stream outside the recording loop
+            self._stream = sd.InputStream(samplerate=self.sample_rate, channels=1,
+                                      callback=self._audio_callback, device=self.device)
+            self._stream.start()
+            
+            # Simply wait while recording
+            while self.recording:
+                sd.sleep(100)
+            
+            # Stop the stream after recording is done
+            self._stream.stop()
             
             if len(self.audio_data) > 0:
-                audio_array = np.concatenate(self.audio_data)
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                self.audio_file = f"recordings/{timestamp}.wav"
-                os.makedirs("recordings", exist_ok=True)
-                sf.write(self.audio_file, audio_array, self.sample_rate)
+                with self._lock:  # Lock while processing audio data
+                    audio_array = np.concatenate(self.audio_data)
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    self.audio_file = f"recordings/{timestamp}.wav"
+                    os.makedirs("recordings", exist_ok=True)
+                    sf.write(self.audio_file, audio_array, self.sample_rate)
                 self.finished.emit(self.audio_file)
-            
-            self.audio_data = []
             
         except Exception as e:
             self.error.emit(str(e))
+            
+        finally:
+            if self._stream:
+                try:
+                    self._stream.stop()
+                    self._stream.close()
+                except Exception as e:
+                    print(f"Error closing stream: {e}")
+            with self._lock:
+                self.audio_data = []
 
     def _audio_callback(self, indata, frames, time, status):
         if status:
             print(f"Status: {status}")
-        if self.recording:
+
+        with self._lock:
+            if not self.recording:
+                return
+
+            # Check size before appending
+            current_size = sum(data.nbytes for data in self.audio_data)
+            if current_size + indata.nbytes > self.max_recording_size:
+                self.recording = False
+                # Schedule error emission to main thread to avoid Qt warnings
+                QApplication.instance().postEvent(
+                    self,
+                    QEvent(QEvent.Type.User)
+                )
+                return
+
             self.audio_data.append(indata.copy())
 
+    def event(self, event):
+        # Handle custom events for error emission
+        if event.type() == QEvent.Type.User:
+            self.error.emit("Recording size limit exceeded")
+            return True
+        return super().event(event)
+
     def start_recording(self):
-        self.recording = True
+        with self._lock:
+            self.recording = True
+            self.audio_data = []
         self.start()
 
     def stop_recording(self):
-        self.recording = False
+        with self._lock:
+            self.recording = False
 
 class SettingsDialog(QDialog):
     def __init__(self, parent=None):
@@ -468,9 +514,21 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Error: Failed to load transcription model")
 
     def load_settings(self):
-        self.device_id = self.settings.value('audio/device', 0, type=int)
-        self.auto_copy.setChecked(self.settings.value('options/auto_copy', True, type=bool))
-        self.auto_paste.setChecked(self.settings.value('options/auto_paste', True, type=bool))
+        try:
+            self.device_id = self.settings.value('audio/device', 0, type=int)
+            devices = sd.query_devices()
+            if self.device_id >= len(devices):
+                self.device_id = 0
+                self.settings.setValue('audio/device', 0)
+            
+            self.auto_copy.setChecked(self.settings.value('options/auto_copy', True, type=bool))
+            self.auto_paste.setChecked(self.settings.value('options/auto_paste', True, type=bool))
+        except Exception as e:
+            print(f"Error loading settings: {e}")
+            # Reset to defaults
+            self.device_id = 0
+            self.auto_copy.setChecked(True)
+            self.auto_paste.setChecked(True)
 
     def save_settings(self):
         self.settings.setValue('options/auto_copy', self.auto_copy.isChecked())
