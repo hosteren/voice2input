@@ -194,21 +194,29 @@ class SettingsDialog(QDialog):
         audio_layout.addWidget(self.device_combo, 0, 1)
         audio_layout.addWidget(self.refresh_button, 0, 2)
         
+        # Add sample rate selection to audio settings
+        self.sample_rate_combo = QComboBox()
+        for rate in [16000, 22050, 44100, 48000]:
+            self.sample_rate_combo.addItem(str(rate))
+            
+        audio_layout.addWidget(QLabel("Sample Rate (Hz):"), 1, 0)
+        audio_layout.addWidget(self.sample_rate_combo, 1, 1)
+        
         # Model Selection
         self.model_combo = QComboBox()
         for model_name in WHISPER_MODELS:
             self.model_combo.addItem(model_name)
             
-        audio_layout.addWidget(QLabel("Whisper Model:"), 1, 0)
-        audio_layout.addWidget(self.model_combo, 1, 1)
+        audio_layout.addWidget(QLabel("Whisper Model:"), 2, 0)
+        audio_layout.addWidget(self.model_combo, 2, 1)
         
         # Language Selection
         self.language_combo = QComboBox()
         for lang_name in LANGUAGES:
             self.language_combo.addItem(lang_name)
             
-        audio_layout.addWidget(QLabel("Language:"), 2, 0)
-        audio_layout.addWidget(self.language_combo, 2, 1)
+        audio_layout.addWidget(QLabel("Language:"), 3, 0)
+        audio_layout.addWidget(self.language_combo, 3, 1)
         
         audio_widget.setLayout(audio_layout)
         tabs.addTab(audio_widget, "Audio")
@@ -297,11 +305,21 @@ class SettingsDialog(QDialog):
         self.record_hotkey.setText(hotkey)
 
     def load_settings(self):
+        """Load all settings from QSettings"""
         settings = QSettings('Voice2Input', 'Voice2Input')
+        
+        # Load audio settings
         device_index = settings.value('audio/device', 0, type=int)
+        sample_rate = settings.value('audio/sample_rate', '44100')
         self.device_combo.setCurrentIndex(device_index)
+        index = self.sample_rate_combo.findText(str(sample_rate))
+        if index >= 0:
+            self.sample_rate_combo.setCurrentIndex(index)
+            
+        # Load hotkey settings
         self.record_hotkey.setText(settings.value('hotkeys/record', 'ctrl+shift+r'))
         
+        # Load model settings
         model_name = settings.value('model/name', 'Large-v3 Turbo')
         language = settings.value('model/language', 'Auto-detect')
         
@@ -314,9 +332,17 @@ class SettingsDialog(QDialog):
             self.language_combo.setCurrentIndex(lang_index)
         
     def save_settings(self):
+        """Save all settings to QSettings"""
         settings = QSettings('Voice2Input', 'Voice2Input')
+        
+        # Save audio settings
         settings.setValue('audio/device', self.device_combo.currentIndex())
+        settings.setValue('audio/sample_rate', self.sample_rate_combo.currentText())
+        
+        # Save hotkey settings
         settings.setValue('hotkeys/record', self.record_hotkey.text())
+        
+        # Save model settings
         settings.setValue('model/name', self.model_combo.currentText())
         settings.setValue('model/language', self.language_combo.currentText())
 
@@ -388,8 +414,20 @@ class MainWindow(QMainWindow):
         
         # System tray
         self.tray_icon = QSystemTrayIcon(self)
-        self.tray_icon.setIcon(QIcon.fromTheme("audio-input-microphone"))
+        icon = QIcon.fromTheme("audio-input-microphone", QIcon("icons/microphone.png"))
+        self.tray_icon.setIcon(icon)
+        self.tray_icon.setToolTip("Voice2Input")
         self.tray_icon.setVisible(True)
+        
+        # Create tray menu
+        tray_menu = QMenu()
+        show_action = QAction("Show", self)
+        show_action.triggered.connect(self.show)
+        quit_action = QAction("Quit", self)
+        quit_action.triggered.connect(self.close)
+        tray_menu.addAction(show_action)
+        tray_menu.addAction(quit_action)
+        self.tray_icon.setContextMenu(tray_menu)
         
         # Initialize recorder and transcription
         self.recorder = None
@@ -514,15 +552,24 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Error: Failed to load transcription model")
 
     def load_settings(self):
+        """Load all application settings"""
         try:
+            # Load audio settings
             self.device_id = self.settings.value('audio/device', 0, type=int)
             devices = sd.query_devices()
             if self.device_id >= len(devices):
                 self.device_id = 0
                 self.settings.setValue('audio/device', 0)
             
+            # Load UI settings
             self.auto_copy.setChecked(self.settings.value('options/auto_copy', True, type=bool))
             self.auto_paste.setChecked(self.settings.value('options/auto_paste', True, type=bool))
+            
+            # Reload audio recorder if sample rate changed
+            current_sample_rate = self.settings.value('audio/sample_rate', '44100')
+            if hasattr(self, 'audio_recorder') and self.audio_recorder.sample_rate != int(current_sample_rate):
+                self.setup_audio_recorder()
+                
         except Exception as e:
             print(f"Error loading settings: {e}")
             # Reset to defaults
@@ -531,11 +578,18 @@ class MainWindow(QMainWindow):
             self.auto_paste.setChecked(True)
 
     def save_settings(self):
+        """Save all application settings including UI state"""
         self.settings.setValue('options/auto_copy', self.auto_copy.isChecked())
         self.settings.setValue('options/auto_paste', self.auto_paste.isChecked())
+        
+        # Save any other settings that might be added in the future
+        self.settings.sync()  # Force settings to be written to disk
 
     def setup_audio_recorder(self):
-        self.audio_recorder = AudioRecorder()
+        """Initialize the audio recorder with current settings"""
+        sample_rate = int(self.settings.value('audio/sample_rate', '44100'))
+        self.audio_recorder = AudioRecorder(sample_rate=sample_rate)
+        self.audio_recorder.set_device(self.device_id)
         self.audio_recorder.finished.connect(self.handle_recording_finished)
         self.audio_recorder.error.connect(self.handle_recording_error)
 
