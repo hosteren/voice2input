@@ -91,42 +91,82 @@ class AudioRecorder(QThread):
         self.audio_file = None
         self._stream = None
         self.max_recording_size = 1024 * 1024 * 100  # 100MB limit
-        # Add lock for thread safety
         self._lock = threading.Lock()
+        self.channels = 1  # Default to mono recording
 
     def set_device(self, device):
-        self.device = device
+        try:
+            # Query device capabilities
+            device_info = sd.query_devices(device)
+            supported_samplerates = device_info['default_samplerate']
+            
+            # Adjust sample rate if needed
+            if self.sample_rate > supported_samplerates:
+                print(f"Adjusting sample rate from {self.sample_rate} to {supported_samplerates}")
+                self.sample_rate = int(supported_samplerates)
+            
+            # Ensure we have at least 1 input channel
+            if device_info['max_input_channels'] < 1:
+                raise ValueError("Device has no input channels")
+                
+            # Always use 1 channel (mono) for recording
+            self.channels = 1
+            
+            # Test if the configuration is valid
+            sd.check_input_settings(
+                device=device,
+                samplerate=self.sample_rate,
+                channels=self.channels
+            )
+            
+            self.device = device
+            print(f"Audio device configured: {device_info['name']}, "
+                  f"Sample rate: {self.sample_rate}, Channels: {self.channels}")
+            
+        except Exception as e:
+            print(f"Error setting audio device: {e}")
+            # Fall back to default device
+            self.device = None
+            raise
 
     def run(self):
         try:
-            # Create stream outside the recording loop
-            self._stream = sd.InputStream(samplerate=self.sample_rate, channels=1,
-                                      callback=self._audio_callback, device=self.device)
-            self._stream.start()
+            if self.device is None:
+                raise ValueError("No valid audio device configured")
+
+            # Create stream with validated parameters
+            self._stream = sd.InputStream(
+                samplerate=self.sample_rate,
+                channels=self.channels,
+                callback=self._audio_callback,
+                device=self.device,
+                blocksize=1024,
+                dtype=np.float32
+            )
             
-            # Simply wait while recording
-            while self.recording:
-                sd.sleep(100)
+            print(f"Starting recording with: Device={self.device}, "
+                  f"Rate={self.sample_rate}, Channels={self.channels}")
             
-            # Stop the stream after recording is done
-            self._stream.stop()
-            
+            with self._stream:
+                while self.recording:
+                    sd.sleep(100)
+                    
             if len(self.audio_data) > 0:
-                with self._lock:  # Lock while processing audio data
+                with self._lock:
                     audio_array = np.concatenate(self.audio_data)
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                     self.audio_file = f"recordings/{timestamp}.wav"
                     os.makedirs("recordings", exist_ok=True)
                     sf.write(self.audio_file, audio_array, self.sample_rate)
                 self.finished.emit(self.audio_file)
-            
+                
         except Exception as e:
+            print(f"Audio recording error: {e}")
             self.error.emit(str(e))
             
         finally:
             if self._stream:
                 try:
-                    self._stream.stop()
                     self._stream.close()
                 except Exception as e:
                     print(f"Error closing stream: {e}")
@@ -184,26 +224,26 @@ class SettingsDialog(QDialog):
         audio_widget = QWidget()
         audio_layout = QGridLayout()
         
+        # Create all UI elements first
         self.device_combo = QComboBox()
         self.refresh_button = QPushButton("Refresh")
-        self.refresh_button.clicked.connect(self.refresh_devices)
+        self.sample_rate_combo = QComboBox()  # Create this before populate_devices
+        self.model_combo = QComboBox()
+        self.language_combo = QComboBox()
         
+        # Now populate devices and connect signals
+        self.refresh_button.clicked.connect(self.refresh_devices)
         self.populate_devices()
                 
         audio_layout.addWidget(QLabel("Input Device:"), 0, 0)
         audio_layout.addWidget(self.device_combo, 0, 1)
         audio_layout.addWidget(self.refresh_button, 0, 2)
         
-        # Add sample rate selection to audio settings
-        self.sample_rate_combo = QComboBox()
-        for rate in [16000, 22050, 44100, 48000]:
-            self.sample_rate_combo.addItem(str(rate))
-            
+        # Add sample rate selection
         audio_layout.addWidget(QLabel("Sample Rate (Hz):"), 1, 0)
         audio_layout.addWidget(self.sample_rate_combo, 1, 1)
         
         # Model Selection
-        self.model_combo = QComboBox()
         for model_name in WHISPER_MODELS:
             self.model_combo.addItem(model_name)
             
@@ -211,7 +251,6 @@ class SettingsDialog(QDialog):
         audio_layout.addWidget(self.model_combo, 2, 1)
         
         # Language Selection
-        self.language_combo = QComboBox()
         for lang_name in LANGUAGES:
             self.language_combo.addItem(lang_name)
             
@@ -220,6 +259,9 @@ class SettingsDialog(QDialog):
         
         audio_widget.setLayout(audio_layout)
         tabs.addTab(audio_widget, "Audio")
+        
+        # Connect device combo signal after creation
+        self.device_combo.currentIndexChanged.connect(self.on_device_changed)
         
         # Hotkey Settings
         hotkey_widget = QWidget()
@@ -262,6 +304,95 @@ class SettingsDialog(QDialog):
         self.setLayout(layout)
         
         self.load_settings()
+
+    def on_device_changed(self, index):
+        """Handle device selection changes"""
+        device_id = self.device_combo.currentData()
+        if device_id is not None and device_id >= 0:
+            try:
+                device = sd.query_devices()[device_id]
+                self.update_sample_rates(device)
+            except Exception as e:
+                print(f"Error updating device settings: {e}")
+                # Reset to first available device if current is invalid
+                if self.device_combo.count() > 0:
+                    self.device_combo.setCurrentIndex(0)
+
+    def populate_devices(self):
+        self.device_combo.clear()
+        devices = sd.query_devices()
+        valid_devices = False
+        
+        for i, dev in enumerate(devices):
+            if dev['max_input_channels'] > 0:
+                self.device_combo.addItem(f"{dev['name']}", i)
+                valid_devices = True
+                
+        if not valid_devices:
+            self.device_combo.addItem("No input devices found", -1)
+            self.device_combo.setEnabled(False)
+            self.sample_rate_combo.setEnabled(False)
+        else:
+            # Update sample rates for the first valid device
+            current_device_id = self.device_combo.currentData()
+            if current_device_id is not None and current_device_id >= 0:
+                self.update_sample_rates(devices[current_device_id])
+
+    def update_sample_rates(self, device):
+        if not hasattr(self, 'sample_rate_combo'):
+            return
+            
+        self.sample_rate_combo.clear()
+        default_rate = int(device['default_samplerate'])
+        
+        # Common sample rates to try
+        sample_rates = [16000, 22050, 44100, 48000]
+        
+        # Add only supported rates
+        supported_rates = []
+        device_id = self.device_combo.currentData()
+        if device_id is not None and device_id >= 0:
+            for rate in sample_rates:
+                try:
+                    sd.check_input_settings(
+                        device=device_id,
+                        samplerate=rate,
+                        channels=1
+                    )
+                    supported_rates.append(rate)
+                except:
+                    continue
+        
+        # If no common rates work, at least add the default
+        if not supported_rates:
+            supported_rates = [default_rate]
+            
+        for rate in supported_rates:
+            self.sample_rate_combo.addItem(str(rate))
+            
+        # Select default rate if available, otherwise first supported rate
+        index = self.sample_rate_combo.findText(str(default_rate))
+        if index >= 0:
+            self.sample_rate_combo.setCurrentIndex(index)
+        else:
+            self.sample_rate_combo.setCurrentIndex(0)
+
+    def refresh_devices(self):
+        self.populate_devices()
+        settings = QSettings('Voice2Input', 'Voice2Input')
+        device_index = settings.value('audio/device', 0, type=int)
+        
+        # Find the combo box index that corresponds to the device ID
+        for i in range(self.device_combo.count()):
+            if self.device_combo.itemData(i) == device_index:
+                self.device_combo.setCurrentIndex(i)
+                break
+        
+        # Update sample rates when device changes
+        current_device_id = self.device_combo.currentData()
+        if current_device_id is not None and current_device_id >= 0:
+            current_device = sd.query_devices()[current_device_id]
+            self.update_sample_rates(current_device)
 
     def start_hotkey_recording(self, event):
         self.current_keys.clear()
@@ -336,7 +467,7 @@ class SettingsDialog(QDialog):
         settings = QSettings('Voice2Input', 'Voice2Input')
         
         # Save audio settings
-        settings.setValue('audio/device', self.device_combo.currentIndex())
+        settings.setValue('audio/device', self.device_combo.currentData())  # Save device ID instead of index
         settings.setValue('audio/sample_rate', self.sample_rate_combo.currentText())
         
         # Save hotkey settings
@@ -345,19 +476,6 @@ class SettingsDialog(QDialog):
         # Save model settings
         settings.setValue('model/name', self.model_combo.currentText())
         settings.setValue('model/language', self.language_combo.currentText())
-
-    def populate_devices(self):
-        self.device_combo.clear()
-        devices = sd.query_devices()
-        for i, dev in enumerate(devices):
-            if dev['max_input_channels'] > 0:
-                self.device_combo.addItem(f"{dev['name']}", i)
-    
-    def refresh_devices(self):
-        self.populate_devices()
-        settings = QSettings('Voice2Input', 'Voice2Input')
-        device_index = settings.value('audio/device', 0, type=int)
-        self.device_combo.setCurrentIndex(device_index)
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -512,9 +630,22 @@ class MainWindow(QMainWindow):
             dialog.save_settings()
             self.load_settings()
             
-            # Update hotkey and record button text
-            self.hotkey = self.settings.value('hotkeys/record', 'ctrl+shift+r')
-            self.update_record_button_text()
+            # Reconfigure audio recorder with new settings
+            try:
+                sample_rate = int(self.settings.value('audio/sample_rate', '44100'))
+                device_id = self.settings.value('audio/device', 0, type=int)
+                
+                print(f"Updating audio configuration - Device: {device_id}, Sample Rate: {sample_rate}")
+                
+                # Create new recorder with updated settings
+                self.audio_recorder = AudioRecorder(sample_rate=sample_rate)
+                self.audio_recorder.finished.connect(self.handle_recording_finished)
+                self.audio_recorder.error.connect(self.handle_recording_error)
+                self.audio_recorder.set_device(device_id)
+                
+            except Exception as e:
+                print(f"Error updating audio configuration: {e}")
+                self.status_label.setText("Error: Failed to update audio device")
 
     def setup_transcription_model(self):
         try:
@@ -587,11 +718,45 @@ class MainWindow(QMainWindow):
 
     def setup_audio_recorder(self):
         """Initialize the audio recorder with current settings"""
-        sample_rate = int(self.settings.value('audio/sample_rate', '44100'))
-        self.audio_recorder = AudioRecorder(sample_rate=sample_rate)
-        self.audio_recorder.set_device(self.device_id)
-        self.audio_recorder.finished.connect(self.handle_recording_finished)
-        self.audio_recorder.error.connect(self.handle_recording_error)
+        try:
+            # Get list of valid input devices
+            devices = sd.query_devices()
+            valid_input_devices = [
+                (i, dev) for i, dev in enumerate(devices) 
+                if dev['max_input_channels'] > 0
+            ]
+            
+            if not valid_input_devices:
+                raise ValueError("No input devices found")
+                
+            # Get saved device ID or use first valid device
+            saved_device_id = self.settings.value('audio/device', valid_input_devices[0][0], type=int)
+            
+            # Check if saved device is still valid
+            valid_device_ids = [i for i, _ in valid_input_devices]
+            if saved_device_id not in valid_device_ids:
+                # Fall back to first valid device
+                self.device_id = valid_device_ids[0]
+                self.settings.setValue('audio/device', self.device_id)
+                print(f"Invalid saved device, falling back to device {self.device_id}")
+            else:
+                self.device_id = saved_device_id
+                
+            sample_rate = int(self.settings.value('audio/sample_rate', '44100'))
+            print(f"Initializing audio recorder - Device: {self.device_id}, Sample Rate: {sample_rate}")
+            
+            self.audio_recorder = AudioRecorder(sample_rate=sample_rate)
+            self.audio_recorder.finished.connect(self.handle_recording_finished)
+            self.audio_recorder.error.connect(self.handle_recording_error)
+            self.audio_recorder.set_device(self.device_id)
+            
+        except Exception as e:
+            print(f"Error setting up audio recorder: {e}")
+            self.status_label.setText(f"Error: Could not initialize audio device")
+            # Create recorder without device to prevent crashes
+            self.audio_recorder = AudioRecorder()
+            self.audio_recorder.finished.connect(self.handle_recording_finished)
+            self.audio_recorder.error.connect(self.handle_recording_error)
 
     def start_recording(self):
         self.status_label.setText('Recording...')
@@ -615,6 +780,10 @@ class MainWindow(QMainWindow):
         self.record_button.setText('Start Recording')
 
     def toggle_recording(self):
+        if not hasattr(self.audio_recorder, 'device') or self.audio_recorder.device is None:
+            self.status_label.setText("Error: No valid audio device")
+            return
+        
         if not self.is_recording:
             self.is_recording = True
             self.start_recording()
@@ -640,7 +809,7 @@ class MainWindow(QMainWindow):
                 generate_kwargs=generate_kwargs
             )
             
-            text = result["text"]
+            text = result["text"].strip()
             
             # Update text box
             self.transcription_text.setText(text)
