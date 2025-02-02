@@ -12,12 +12,13 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                             QPushButton, QLabel, QComboBox, QSystemTrayIcon,
                             QMenu, QDialog, QTabWidget, QGridLayout, QCheckBox,
                             QSpinBox, QLineEdit, QTextEdit)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings, QEvent
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings, QEvent, QTimer
 from PyQt6.QtGui import QIcon, QAction
 import pyperclip
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
 from pynput import keyboard as kb
 import threading
+import time
 
 WHISPER_MODELS = {
     "Tiny": "openai/whisper-tiny",
@@ -466,14 +467,15 @@ class SettingsDialog(QDialog):
         """Save all settings to QSettings"""
         settings = QSettings('Voice2Input', 'Voice2Input')
         
-        # Save audio settings
-        settings.setValue('audio/device', self.device_combo.currentData())  # Save device ID instead of index
+        # Save audio settings with both ID and name
+        device_id = self.device_combo.currentData()
+        if device_id is not None and device_id >= 0:
+            settings.setValue('audio/device', device_id)
+            device_name = sd.query_devices()[device_id]['name']
+            settings.setValue('audio/device_name', device_name)
+            
         settings.setValue('audio/sample_rate', self.sample_rate_combo.currentText())
-        
-        # Save hotkey settings
         settings.setValue('hotkeys/record', self.record_hotkey.text())
-        
-        # Save model settings
         settings.setValue('model/name', self.model_combo.currentText())
         settings.setValue('model/language', self.language_combo.currentText())
 
@@ -488,6 +490,21 @@ class MainWindow(QMainWindow):
         
         # Create necessary directories
         os.makedirs("recordings", exist_ok=True)
+        
+        # Initialize keyboard state before anything else
+        self.pressed_keys = set()  # Move this initialization earlier
+        self.hotkey_lock = threading.Lock()
+        self.keyboard_listener = None
+        self.is_recording = False
+        self.hotkey_active = False
+        self.hotkey_timer = None
+        self.hotkey = self.settings.value('hotkeys/record', 'ctrl+shift+r')  # Initialize hotkey value
+        
+        # Initialize audio recorder before anything else
+        self.setup_audio_recorder()
+        
+        # Initialize the transcription model
+        self.setup_transcription_model()
         
         # Create central widget and layout
         central_widget = QWidget()
@@ -541,22 +558,22 @@ class MainWindow(QMainWindow):
         tray_menu = QMenu()
         show_action = QAction("Show", self)
         show_action.triggered.connect(self.show)
+        restart_hotkeys_action = QAction("Restart Hotkeys", self)
+        restart_hotkeys_action.triggered.connect(self.setup_hotkeys)
         quit_action = QAction("Quit", self)
         quit_action.triggered.connect(self.close)
+        
         tray_menu.addAction(show_action)
+        tray_menu.addAction(restart_hotkeys_action)
         tray_menu.addAction(quit_action)
         self.tray_icon.setContextMenu(tray_menu)
         
-        # Initialize recorder and transcription
-        self.recorder = None
-        self.recording = False
-        self.is_recording = False
-        
-        # Load settings and setup components
-        self.load_settings()
-        self.setup_transcription_model()
-        self.setup_audio_recorder()
-        self.setup_hotkeys()
+        # Setup hotkeys with retry
+        if self.setup_hotkeys():  # Only proceed if hotkey setup succeeds
+            # Initialize timer for hotkey checks
+            self.hotkey_timer = QTimer(self)
+            self.hotkey_timer.timeout.connect(self.check_hotkey_listener)
+            self.hotkey_timer.start(20000)  # Check every 20 seconds
         
         # Update record button text with current hotkey
         self.update_record_button_text()
@@ -566,63 +583,121 @@ class MainWindow(QMainWindow):
         self.record_button.setText(f"Start Recording ({hotkey})")
 
     def setup_hotkeys(self):
+        """Setup keyboard listener with error handling and retries"""
         try:
-            self.hotkey = self.settings.value('hotkeys/record', 'ctrl+shift+r')
-            self.pressed_keys = set()
-            
-            self.keyboard_listener = kb.Listener(
-                on_press=self.on_key_press,
-                on_release=self.on_key_release
-            )
-            self.keyboard_listener.start()
-            
+            with self.hotkey_lock:
+                # Clean up existing listener if any
+                if self.keyboard_listener:
+                    try:
+                        self.keyboard_listener.stop()
+                        self.keyboard_listener = None
+                    except Exception as e:
+                        print(f"Error stopping existing listener: {e}")
+
+                # Reset state
+                self.pressed_keys = set()
+                self.hotkey_active = False  # Ensure inactive during setup
+                
+                # Create and start new listener
+                self.keyboard_listener = kb.Listener(
+                    on_press=self.on_key_press,
+                    on_release=self.on_key_release,
+                    suppress=False
+                )
+                self.keyboard_listener.daemon = True
+                self.keyboard_listener.start()
+                
+                # Wait for listener to start and verify it's functioning
+                start_time = time.time()
+                max_wait = 2.0  # Maximum wait time in seconds
+                
+                while time.time() - start_time < max_wait:
+                    if self.keyboard_listener.is_alive():
+                        # Additional verification - try to join briefly
+                        self.keyboard_listener.join(timeout=0.1)
+                        if self.keyboard_listener.is_alive():
+                            self.hotkey_active = True  # Only set active after verification
+                            print("Keyboard listener verified and active")
+                            return True
+                    time.sleep(0.1)
+                    
+                raise RuntimeError("Failed to verify keyboard listener")
+                
         except Exception as e:
             print(f"Error setting up hotkeys: {e}")
             self.status_label.setText("Error: Failed to setup hotkeys")
+            self.hotkey_active = False
+            return False
 
     def on_key_press(self, key):
+        """Handle key press events with proper error checking"""
+        if not hasattr(self, 'pressed_keys'):
+            print("Warning: pressed_keys not initialized")
+            self.pressed_keys = set()  # Auto-initialize if missing
+            
+        if not hasattr(self, 'audio_recorder') or not self.hotkey_active:
+            return
+
         try:
             # Convert key to string representation
-            if hasattr(key, 'char'):
+            key_str = None
+            if hasattr(key, 'char') and key.char is not None:
                 key_str = key.char.lower()
-            elif hasattr(key, 'name'):
+            elif hasattr(key, 'name') and key.name is not None:
                 key_str = key.name.lower()
-            else:
-                return
             
-            # Add key to pressed keys
-            self.pressed_keys.add(key_str)
+            if key_str is None:
+                return  # Skip invalid keys
             
-            # Check if current combination matches hotkey
-            current_combo = '+'.join(sorted(self.pressed_keys))
-            if current_combo == self.hotkey and not self.is_recording:
-                self.is_recording = True
-                self.start_recording()
+            with self.hotkey_lock:
+                self.pressed_keys.add(key_str)
+                current_combo = '+'.join(sorted(self.pressed_keys))
+                
+                if current_combo == self.hotkey and not self.is_recording:
+                    print("Hotkey pressed - starting recording")
+                    self.is_recording = True
+                    self.start_recording()
                 
         except Exception as e:
             print(f"Error in key press handler: {e}")
+            self.hotkey_active = False  # Mark for restart
+            if hasattr(self, 'status_label'):
+                self.status_label.setText("Error: Keyboard handler failed")
 
     def on_key_release(self, key):
+        """Handle key release events with proper error checking"""
+        if not hasattr(self, 'pressed_keys'):
+            print("Warning: pressed_keys not initialized")
+            self.pressed_keys = set()  # Auto-initialize if missing
+            
+        if not hasattr(self, 'audio_recorder') or not self.hotkey_active:
+            return
+
         try:
             # Convert key to string representation
-            if hasattr(key, 'char'):
+            key_str = None
+            if hasattr(key, 'char') and key.char is not None:
                 key_str = key.char.lower()
-            elif hasattr(key, 'name'):
+            elif hasattr(key, 'name') and key.name is not None:
                 key_str = key.name.lower()
-            else:
-                return
             
-            # Remove key from pressed keys
-            self.pressed_keys.discard(key_str)
+            if key_str is None:
+                return  # Skip invalid keys
             
-            # Check if we should stop recording
-            current_combo = '+'.join(sorted(self.pressed_keys))
-            if self.is_recording and current_combo != self.hotkey:
-                self.is_recording = False
-                self.stop_recording()
+            with self.hotkey_lock:
+                self.pressed_keys.discard(key_str)
+                current_combo = '+'.join(sorted(self.pressed_keys))
+                
+                if self.is_recording and current_combo != self.hotkey:
+                    print("Hotkey released - stopping recording")
+                    self.is_recording = False
+                    self.stop_recording()
                 
         except Exception as e:
             print(f"Error in key release handler: {e}")
+            self.hotkey_active = False  # Mark for restart
+            if hasattr(self, 'status_label'):
+                self.status_label.setText("Error: Keyboard handler failed")
 
     def show_settings(self):
         dialog = SettingsDialog(self)
@@ -717,9 +792,8 @@ class MainWindow(QMainWindow):
         self.settings.sync()  # Force settings to be written to disk
 
     def setup_audio_recorder(self):
-        """Initialize the audio recorder with current settings"""
         try:
-            # Get list of valid input devices
+            # Query all devices and find valid input devices
             devices = sd.query_devices()
             valid_input_devices = [
                 (i, dev) for i, dev in enumerate(devices) 
@@ -728,32 +802,61 @@ class MainWindow(QMainWindow):
             
             if not valid_input_devices:
                 raise ValueError("No input devices found")
-                
-            # Get saved device ID or use first valid device
-            saved_device_id = self.settings.value('audio/device', valid_input_devices[0][0], type=int)
             
-            # Check if saved device is still valid
-            valid_device_ids = [i for i, _ in valid_input_devices]
-            if saved_device_id not in valid_device_ids:
+            # Get saved device name and ID
+            default_device = valid_input_devices[0][0]  # First valid device as default
+            saved_device_id = self.settings.value('audio/device', default_device, type=int)
+            saved_device_name = self.settings.value('audio/device_name', '')
+            
+            # Initialize device variables
+            device_id = default_device  # Always start with a valid default
+            device_name = devices[default_device]['name']  # Get default device name
+            
+            # First try to find device by name (helps with USB devices)
+            if saved_device_name:
+                for device_index, device_dict in valid_input_devices:
+                    if device_dict['name'] == saved_device_name:
+                        device_id = device_index
+                        device_name = device_dict['name']
+                        break
+            
+            # If name lookup failed, try the saved ID
+            if device_id == default_device and saved_device_id != default_device:
+                valid_ids = [i for i, _ in valid_input_devices]
+                if saved_device_id in valid_ids:
+                    device_id = saved_device_id
+                    device_name = devices[device_id]['name']
+            
+            # Validate the selected device
+            try:
+                sd.check_input_settings(
+                    device=device_id,
+                    channels=1,
+                    dtype=np.float32
+                )
+            except Exception as e:
+                print(f"Selected device {device_id} is invalid: {e}")
                 # Fall back to first valid device
-                self.device_id = valid_device_ids[0]
-                self.settings.setValue('audio/device', self.device_id)
-                print(f"Invalid saved device, falling back to device {self.device_id}")
-            else:
-                self.device_id = saved_device_id
-                
-            sample_rate = int(self.settings.value('audio/sample_rate', '44100'))
-            print(f"Initializing audio recorder - Device: {self.device_id}, Sample Rate: {sample_rate}")
+                device_id = default_device
+                device_name = devices[default_device]['name']
             
+            print(f"Selected audio device: {device_name} (ID: {device_id})")
+            
+            # Save current device info
+            self.settings.setValue('audio/device', device_id)
+            self.settings.setValue('audio/device_name', device_name)
+            
+            # Initialize audio recorder
+            sample_rate = int(self.settings.value('audio/sample_rate', '44100'))
             self.audio_recorder = AudioRecorder(sample_rate=sample_rate)
+            self.audio_recorder.set_device(device_id)
             self.audio_recorder.finished.connect(self.handle_recording_finished)
             self.audio_recorder.error.connect(self.handle_recording_error)
-            self.audio_recorder.set_device(self.device_id)
             
         except Exception as e:
             print(f"Error setting up audio recorder: {e}")
-            self.status_label.setText(f"Error: Could not initialize audio device")
-            # Create recorder without device to prevent crashes
+            self.status_label.setText("Error: Could not initialize audio device")
+            # Create basic recorder without device for error handling
             self.audio_recorder = AudioRecorder()
             self.audio_recorder.finished.connect(self.handle_recording_finished)
             self.audio_recorder.error.connect(self.handle_recording_error)
@@ -839,13 +942,51 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.handle_recording_error(f"Error transcribing audio: {str(e)}")
 
+    def check_hotkey_listener(self):
+        """Ensure keyboard listener is active, restart if needed"""
+        try:
+            with self.hotkey_lock:
+                if not self.keyboard_listener or \
+                   not self.keyboard_listener.is_alive() or \
+                   not self.hotkey_active:
+                    print("Keyboard listener needs restart...")
+                    self.hotkey_active = False
+                    if not self.setup_hotkeys():  # If restart fails
+                        if self.hotkey_timer:  # Stop timer if hotkeys can't be restored
+                            self.hotkey_timer.stop()
+                            print("Hotkey timer stopped due to persistent failures")
+                    else:
+                        print("Keyboard listener restarted successfully")
+        except Exception as e:
+            print(f"Error checking hotkey listener: {e}")
+            if self.hotkey_timer:
+                self.hotkey_timer.stop()  # Stop timer on persistent errors
+
     def closeEvent(self, event):
-        self.save_settings()
-        if hasattr(self, 'is_recording') and self.is_recording:
-            self.stop_recording()
-        if hasattr(self, 'keyboard_listener'):
-            self.keyboard_listener.stop()
-        event.accept()
+        """Ensure clean shutdown"""
+        try:
+            self.save_settings()
+            if self.is_recording:
+                self.stop_recording()
+            
+            # Stop the hotkey timer first
+            if self.hotkey_timer:
+                self.hotkey_timer.stop()
+                self.hotkey_timer = None
+            
+            # Clean up keyboard listener with proper ordering
+            with self.hotkey_lock:
+                # First disable hotkey processing
+                self.hotkey_active = False
+                # Then stop the listener
+                if self.keyboard_listener:
+                    self.keyboard_listener.stop()
+                    self.keyboard_listener = None
+            
+        except Exception as e:
+            print(f"Error during shutdown: {e}")
+        finally:
+            event.accept()
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
