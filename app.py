@@ -19,6 +19,7 @@ from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
 from pynput import keyboard as kb
 import threading
 import time
+import csv
 
 WHISPER_MODELS = {
     "Tiny": "openai/whisper-tiny",
@@ -320,24 +321,47 @@ class SettingsDialog(QDialog):
                     self.device_combo.setCurrentIndex(0)
 
     def populate_devices(self):
+        """Populate the device combo box with available input devices"""
         self.device_combo.clear()
-        devices = sd.query_devices()
-        valid_devices = False
-        
-        for i, dev in enumerate(devices):
-            if dev['max_input_channels'] > 0:
-                self.device_combo.addItem(f"{dev['name']}", i)
-                valid_devices = True
+        try:
+            devices = sd.query_devices()
+            valid_devices = False
+            
+            for i, dev in enumerate(devices):
+                if dev['max_input_channels'] > 0:
+                    name = dev['name']
+                    # Add device name and ID to combo box
+                    self.device_combo.addItem(f"{name}", i)
+                    valid_devices = True
+                    
+            if not valid_devices:
+                self.device_combo.addItem("No input devices found", -1)
+                self.device_combo.setEnabled(False)
+                self.sample_rate_combo.setEnabled(False)
+            else:
+                self.device_combo.setEnabled(True)
+                self.sample_rate_combo.setEnabled(True)
                 
-        if not valid_devices:
-            self.device_combo.addItem("No input devices found", -1)
+                # Set the current device from settings
+                settings = QSettings('Voice2Input', 'Voice2Input')
+                device_id = settings.value('audio/device', 0, type=int)
+                
+                # Find and select the current device
+                for i in range(self.device_combo.count()):
+                    if self.device_combo.itemData(i) == device_id:
+                        self.device_combo.setCurrentIndex(i)
+                        break
+                        
+                # Update sample rates for the selected device
+                if self.device_combo.currentData() is not None:
+                    current_device = devices[self.device_combo.currentData()]
+                    self.update_sample_rates(current_device)
+                    
+        except Exception as e:
+            print(f"Error populating devices: {e}")
+            self.device_combo.addItem("Error loading devices", -1)
             self.device_combo.setEnabled(False)
             self.sample_rate_combo.setEnabled(False)
-        else:
-            # Update sample rates for the first valid device
-            current_device_id = self.device_combo.currentData()
-            if current_device_id is not None and current_device_id >= 0:
-                self.update_sample_rates(devices[current_device_id])
 
     def update_sample_rates(self, device):
         if not hasattr(self, 'sample_rate_combo'):
@@ -526,8 +550,10 @@ class MainWindow(QMainWindow):
         
         self.auto_copy = QCheckBox("Auto-copy to clipboard")
         self.auto_paste = QCheckBox("Auto-paste to active window")
-        self.auto_copy.setChecked(True)
-        self.auto_paste.setChecked(True)
+        
+        # Load checkbox states from settings
+        self.auto_copy.setChecked(self.settings.value('options/auto_copy', True, type=bool))
+        self.auto_paste.setChecked(self.settings.value('options/auto_paste', True, type=bool))
         
         checkbox_layout.addWidget(self.auto_copy, 0, 0)
         checkbox_layout.addWidget(self.auto_paste, 0, 1)
@@ -917,14 +943,17 @@ class MainWindow(QMainWindow):
             # Update text box
             self.transcription_text.setText(text)
             
-            # Save to CSV in the recordings directory
+            # Save to CSV in the recordings directory with proper escaping
             csv_file = os.path.join("recordings", "transcriptions.csv")
             if not os.path.exists(csv_file):
                 with open(csv_file, "w", encoding='utf-8') as f:
                     f.write("id,text\n")
             
             with open(csv_file, "a", encoding='utf-8') as f:
-                f.write(f"{os.path.basename(filename)},{text.replace(',', ' ')}\n")
+                # Use csv module for proper escaping
+                
+                writer = csv.writer(f, quoting=csv.QUOTE_MINIMAL)
+                writer.writerow([os.path.basename(filename), text])
             
             # Handle clipboard and pasting based on checkbox settings
             if self.auto_copy.isChecked():
