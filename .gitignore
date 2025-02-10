@@ -26,8 +26,10 @@ share/python-wheels/
 *.egg
 MANIFEST
 
+# Notes
 .notes/
 .cursor/
+
 recordings/
 
 # PyInstaller

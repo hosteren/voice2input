@@ -47,6 +47,12 @@ pip install -r requirements.txt
 
 ## 🎮 How to Use It
 
+### 🔧 Environment Variables
+
+This project uses a `.env` file to manage sensitive configurations and API credentials. The app loads these variables automatically using [python-dotenv](https://pypi.org/project/python-dotenv/). Either create your own `.env` file or use the `.env.example` file as a template.
+
+### 🔧 Running the App
+
 1. Fire it up:
 ```bash
 python app.py

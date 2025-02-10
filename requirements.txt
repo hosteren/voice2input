@@ -7,4 +7,6 @@ xsel>=0.1.0
 python-xlib>=0.33
 soundfile>=0.12.1
 pynput>=1.7.6
-datasets>=2.16.1 
+datasets>=2.16.1
+python-dotenv>=1.0.0
+requests>=2.31.0 

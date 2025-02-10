@@ -1,25 +1,23 @@
 import sys
-import json
 import os
 import sounddevice as sd
 import soundfile as sf
 import numpy as np
-import keyboard
 import torch
 import subprocess
 from datetime import datetime
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                             QPushButton, QLabel, QComboBox, QSystemTrayIcon,
                             QMenu, QDialog, QTabWidget, QGridLayout, QCheckBox,
-                            QSpinBox, QLineEdit, QTextEdit)
+                            QLineEdit, QTextEdit, QHBoxLayout, QDialogButtonBox)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings, QEvent, QTimer
 from PyQt6.QtGui import QIcon, QAction
-import pyperclip
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
 from pynput import keyboard as kb
 import threading
 import time
 import csv
+import requests
 
 WHISPER_MODELS = {
     "Tiny": "openai/whisper-tiny",
@@ -98,14 +96,15 @@ class AudioRecorder(QThread):
 
     def set_device(self, device):
         try:
-            # Query device capabilities
+            # Get fresh device info
+            sd._terminate()
+            sd._initialize()
             device_info = sd.query_devices(device)
-            supported_samplerates = device_info['default_samplerate']
             
             # Adjust sample rate if needed
-            if self.sample_rate > supported_samplerates:
-                print(f"Adjusting sample rate from {self.sample_rate} to {supported_samplerates}")
-                self.sample_rate = int(supported_samplerates)
+            if self.sample_rate > device_info['default_samplerate']:
+                print(f"Adjusting sample rate from {self.sample_rate} to {device_info['default_samplerate']}")
+                self.sample_rate = int(device_info['default_samplerate'])
             
             # Ensure we have at least 1 input channel
             if device_info['max_input_channels'] < 1:
@@ -290,19 +289,14 @@ class SettingsDialog(QDialog):
         hotkey_widget.setLayout(hotkey_layout)
         tabs.addTab(hotkey_widget, "Hotkeys")
         
-        # Add buttons at the bottom
-        button_layout = QGridLayout()
-        save_button = QPushButton("Save")
-        cancel_button = QPushButton("Cancel")
-        
-        save_button.clicked.connect(self.accept)
-        cancel_button.clicked.connect(self.reject)
-        
-        button_layout.addWidget(save_button, 0, 0)
-        button_layout.addWidget(cancel_button, 0, 1)
-        
         layout.addWidget(tabs)
-        layout.addLayout(button_layout)
+        
+        # Add Save and Cancel buttons using QDialogButtonBox
+        self.buttonBox = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        self.buttonBox.accepted.connect(self.save_and_accept)
+        self.buttonBox.rejected.connect(self.reject)
+        layout.addWidget(self.buttonBox)
+
         self.setLayout(layout)
         
         self.load_settings()
@@ -324,34 +318,32 @@ class SettingsDialog(QDialog):
         """Populate the device combo box with available input devices"""
         self.device_combo.clear()
         try:
+            # Reset sounddevice to detect new devices
+            sd._terminate()
+            sd._initialize()
+            
             devices = sd.query_devices()
             valid_devices = False
+            settings = QSettings('Voice2Input', 'Voice2Input')
+            current_device_id = settings.value('audio/device', 0, type=int)
             
             for i, dev in enumerate(devices):
-                if dev['max_input_channels'] > 0:
+                if dev['max_input_channels'] >= 1:
                     name = dev['name']
-                    # Add device name and ID to combo box
-                    self.device_combo.addItem(f"{name}", i)
+                    self.device_combo.addItem(f"{name} (Channels: {dev['max_input_channels']})", i)
                     valid_devices = True
-                    
+                    # Select this device if it matches the saved device ID
+                    if i == current_device_id:
+                        self.device_combo.setCurrentIndex(self.device_combo.count() - 1)
+            
             if not valid_devices:
-                self.device_combo.addItem("No input devices found", -1)
+                self.device_combo.addItem("No input devices found - plug in mic and click refresh", -1)
                 self.device_combo.setEnabled(False)
                 self.sample_rate_combo.setEnabled(False)
             else:
                 self.device_combo.setEnabled(True)
                 self.sample_rate_combo.setEnabled(True)
                 
-                # Set the current device from settings
-                settings = QSettings('Voice2Input', 'Voice2Input')
-                device_id = settings.value('audio/device', 0, type=int)
-                
-                # Find and select the current device
-                for i in range(self.device_combo.count()):
-                    if self.device_combo.itemData(i) == device_id:
-                        self.device_combo.setCurrentIndex(i)
-                        break
-                        
                 # Update sample rates for the selected device
                 if self.device_combo.currentData() is not None:
                     current_device = devices[self.device_combo.currentData()]
@@ -359,7 +351,7 @@ class SettingsDialog(QDialog):
                     
         except Exception as e:
             print(f"Error populating devices: {e}")
-            self.device_combo.addItem("Error loading devices", -1)
+            self.device_combo.addItem("Error detecting devices - click refresh", -1)
             self.device_combo.setEnabled(False)
             self.sample_rate_combo.setEnabled(False)
 
@@ -503,6 +495,10 @@ class SettingsDialog(QDialog):
         settings.setValue('model/name', self.model_combo.currentText())
         settings.setValue('model/language', self.language_combo.currentText())
 
+    def save_and_accept(self):
+        self.save_settings()
+        self.accept()
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -516,19 +512,23 @@ class MainWindow(QMainWindow):
         os.makedirs("recordings", exist_ok=True)
         
         # Initialize keyboard state before anything else
-        self.pressed_keys = set()  # Move this initialization earlier
+        self.pressed_keys = set()
         self.hotkey_lock = threading.Lock()
         self.keyboard_listener = None
         self.is_recording = False
         self.hotkey_active = False
         self.hotkey_timer = None
-        self.hotkey = self.settings.value('hotkeys/record', 'ctrl+shift+r')  # Initialize hotkey value
+        self.hotkey = self.settings.value('hotkeys/record', 'ctrl+shift+r')
         
         # Initialize audio recorder before anything else
         self.setup_audio_recorder()
         
-        # Initialize the transcription model
-        self.setup_transcription_model()
+        # Initialize transcription mode before model setup
+        self.setup_transcription_mode()
+        
+        # Only initialize the model if using local mode
+        if not self.use_remote:
+            self.setup_transcription_model()
         
         # Create central widget and layout
         central_widget = QWidget()
@@ -555,6 +555,9 @@ class MainWindow(QMainWindow):
         self.auto_copy.setChecked(self.settings.value('options/auto_copy', True, type=bool))
         self.auto_paste.setChecked(self.settings.value('options/auto_paste', True, type=bool))
         
+        # Connect the auto_copy state change to update auto-paste behavior immediately
+        self.auto_copy.stateChanged.connect(self.update_auto_paste_state)
+        
         checkbox_layout.addWidget(self.auto_copy, 0, 0)
         checkbox_layout.addWidget(self.auto_paste, 0, 1)
         
@@ -569,6 +572,32 @@ class MainWindow(QMainWindow):
         settings_button = QPushButton("Settings")
         settings_button.clicked.connect(self.show_settings)
         layout.addWidget(settings_button)
+        
+        # Add a horizontal layout at the bottom of the main window for local model controls
+        bottom_layout = QHBoxLayout()
+        self.use_local_checkbox = QCheckBox("Use Local Model")
+        # Default state: unchecked (meaning remote mode)
+        self.use_local_checkbox.setChecked(False)
+        self.use_local_checkbox.stateChanged.connect(self.on_local_model_toggle)
+        bottom_layout.addWidget(self.use_local_checkbox)
+
+        self.load_model_button = QPushButton("Load Local Model")
+        self.load_model_button.clicked.connect(self.toggle_local_model)
+        # Disabled by default because remote mode is active
+        self.load_model_button.setEnabled(False)
+        bottom_layout.addWidget(self.load_model_button)
+
+        # Add the bottom_layout to the main vertical layout
+        layout.addLayout(bottom_layout)
+
+        # Update the status label according to current mode
+        if self.use_local_checkbox.isChecked():
+            self.status_label.setText("Local Model Mode selected. Click 'Load Local Model' to load.")
+        else:
+            self.status_label.setText("Remote Mode (HuggingFace) active.")
+
+        # Initialize mode flag
+        self.use_remote = not self.use_local_checkbox.isChecked()
         
         central_widget.setLayout(layout)
         self.setCentralWidget(central_widget)
@@ -603,6 +632,10 @@ class MainWindow(QMainWindow):
         
         # Update record button text with current hotkey
         self.update_record_button_text()
+        
+        self.device_check_timer = QTimer(self)
+        self.device_check_timer.timeout.connect(self.check_audio_devices)
+        self.device_check_timer.start(5000)  # Check every 5 seconds
 
     def update_record_button_text(self):
         hotkey = self.settings.value('hotkeys/record', 'ctrl+shift+r')
@@ -750,6 +783,10 @@ class MainWindow(QMainWindow):
 
     def setup_transcription_model(self):
         try:
+            # Only skip loading if the model is already loaded (i.e., pipe is not None)
+            if hasattr(self, 'pipe') and self.pipe is not None:
+                return  # Already loaded
+            
             self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
             self.torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
             
@@ -788,37 +825,43 @@ class MainWindow(QMainWindow):
         try:
             # Load audio settings
             self.device_id = self.settings.value('audio/device', 0, type=int)
-            devices = sd.query_devices()
-            if self.device_id >= len(devices):
-                self.device_id = 0
-                self.settings.setValue('audio/device', 0)
             
-            # Load UI settings
-            self.auto_copy.setChecked(self.settings.value('options/auto_copy', True, type=bool))
-            self.auto_paste.setChecked(self.settings.value('options/auto_paste', True, type=bool))
+            # Load checkbox states with proper type conversion
+            self.auto_copy.setChecked(self.settings.value('options/auto_copy', False, type=bool))
+            self.auto_paste.setChecked(self.settings.value('options/auto_paste', False, type=bool))
+            
+            # Load local mode setting and update the tickbox
+            self.use_local_checkbox.setChecked(self.settings.value('api/local_mode', False, type=bool))
             
             # Reload audio recorder if sample rate changed
             current_sample_rate = self.settings.value('audio/sample_rate', '44100')
             if hasattr(self, 'audio_recorder') and self.audio_recorder.sample_rate != int(current_sample_rate):
                 self.setup_audio_recorder()
-                
+            
+            # Setup transcription mode
+            self.setup_transcription_mode()
+            
         except Exception as e:
             print(f"Error loading settings: {e}")
-            # Reset to defaults
-            self.device_id = 0
-            self.auto_copy.setChecked(True)
-            self.auto_paste.setChecked(True)
 
     def save_settings(self):
         """Save all application settings including UI state"""
-        self.settings.setValue('options/auto_copy', self.auto_copy.isChecked())
-        self.settings.setValue('options/auto_paste', self.auto_paste.isChecked())
-        
-        # Save any other settings that might be added in the future
-        self.settings.sync()  # Force settings to be written to disk
+        try:
+            # Save checkbox states
+            self.settings.setValue('options/auto_copy', self.auto_copy.isChecked())
+            self.settings.setValue('options/auto_paste', self.auto_paste.isChecked())
+            # Save the local mode selection
+            self.settings.setValue('api/local_mode', self.use_local_checkbox.isChecked())
+            self.settings.sync()  # Force settings to be written to disk
+        except Exception as e:
+            print(f"Error saving settings: {e}")
 
     def setup_audio_recorder(self):
         try:
+            # Reset sounddevice to detect changes
+            sd._terminate()
+            sd._initialize()
+            
             # Query all devices and find valid input devices
             devices = sd.query_devices()
             valid_input_devices = [
@@ -924,19 +967,13 @@ class MainWindow(QMainWindow):
         try:
             self.status_label.setText('Transcribing...')
             
-            language = self.settings.value('model/language', 'Auto-detect')
-            language_code = LANGUAGES[language]
-            
-            # Add language detection and proper attention mask
-            generate_kwargs = {"task": "transcribe"}
-            if language_code != "auto":
-                generate_kwargs["language"] = language_code
-            
-            result = self.pipe(
-                filename,
-                return_timestamps=True,
-                generate_kwargs=generate_kwargs
-            )
+            # Check the local mode tickbox to decide which transcription to use
+            if self.use_local_checkbox.isChecked():
+                if not hasattr(self, 'pipe'):
+                    raise Exception("Local model is not loaded. Please click the 'Load Local Model' button.")
+                result = self.local_transcribe(filename)
+            else:
+                result = self.remote_transcribe(filename)
             
             text = result["text"].strip()
             
@@ -970,6 +1007,52 @@ class MainWindow(QMainWindow):
             
         except Exception as e:
             self.handle_recording_error(f"Error transcribing audio: {str(e)}")
+
+    def remote_transcribe(self, filename):
+        """Use HuggingFace Inference API for transcription"""
+        API_URL = "https://api-inference.huggingface.co/models/openai/whisper-large-v3-turbo"
+        headers = {"Authorization": f"Bearer {self.api_token}"}
+        
+        try:
+            # Read audio file as binary
+            with open(filename, "rb") as f:
+                data = f.read()
+            
+            response = requests.post(API_URL, headers=headers, data=data)
+            response.raise_for_status()  # Raise exception for bad status codes
+            result = response.json()
+            
+            if isinstance(result, list) and len(result) > 0:
+                # Handle case where API returns list of results
+                result = result[0]
+            
+            if 'error' in result:
+                raise Exception(f"API Error: {result['error']}")
+            if 'text' not in result:
+                raise Exception("No transcription returned from API")
+            
+            return {"text": result['text'].strip()}
+            
+        except requests.exceptions.RequestException as e:
+            raise Exception(f"API Request failed: {str(e)}")
+        except Exception as e:
+            raise Exception(f"Remote transcription failed: {str(e)}")
+
+    def local_transcribe(self, filename):
+        """
+        Transcribe the given audio file using the local Whisper model.
+        If the model is not loaded, it is loaded on demand.
+        Returns:
+            dict: A dictionary containing the transcription text under the "text" key.
+        Raises:
+            Exception: If the transcription result is None.
+        """
+        if not hasattr(self, 'pipe'):
+            self.setup_transcription_model()
+        result = self.pipe(filename)
+        if result is None:
+            raise Exception("Local transcription failed: No result returned from the local pipeline.")
+        return result
 
     def check_hotkey_listener(self):
         """Ensure keyboard listener is active, restart if needed"""
@@ -1016,6 +1099,101 @@ class MainWindow(QMainWindow):
             print(f"Error during shutdown: {e}")
         finally:
             event.accept()
+
+    def setup_transcription_mode(self):
+        """Setup transcription mode based on the tickbox state.
+        Loads API token from .env and unloads local model if remote mode is selected.
+        """
+        from dotenv import load_dotenv
+        load_dotenv()
+        # Load API token from settings, fallback to .env
+        self.api_token = self.settings.value('api/token', '')
+        if not self.api_token:
+            self.api_token = os.getenv('HF_API_TOKEN', '')
+        # Use settings key 'api/mode' to determine transcription mode
+        # Valid values are "Remote (HuggingFace)" or "Local"
+        self.use_remote = self.settings.value('api/mode', 'Remote (HuggingFace)') == 'Remote (HuggingFace)'
+
+    def check_audio_devices(self):
+        """Periodically check for device changes"""
+        try:
+            current_devices = [d['name'] for d in sd.query_devices() if d['max_input_channels'] >= 1]
+            if not hasattr(self, 'last_devices'):
+                self.last_devices = current_devices
+                return
+            
+            if current_devices != self.last_devices:
+                print("Audio devices changed - refreshing list")
+                self.last_devices = current_devices
+                self.setup_audio_recorder()
+                QApplication.instance().postEvent(self, QEvent(QEvent.Type.User))
+            
+        except Exception as e:
+            print(f"Device check error: {e}")
+
+    def event(self, event):
+        if event.type() == QEvent.Type.User:
+            self.status_label.setText("Audio devices changed - settings updated")
+            return True
+        return super().event(event)
+
+    def on_local_model_toggle(self, state):
+        """
+        Triggered when the "Use Local Model" tick box is toggled.
+        If checked, local mode is activated and the load button is enabled.
+        Otherwise, remote mode is active and the load button is disabled.
+        Also, if local mode is turned off while a model is loaded, unload it.
+        """
+        if self.use_local_checkbox.isChecked():
+            self.use_remote = False
+            self.load_model_button.setEnabled(True)
+            self.status_label.setText("Local Model Mode selected. Click 'Load Local Model' to load.")
+        else:
+            self.use_remote = True
+            self.load_model_button.setEnabled(False)
+            self.status_label.setText("Remote Mode (HuggingFace) active.")
+            # Unload the local model if it is currently loaded.
+            if hasattr(self, 'pipe') and self.pipe is not None:
+                self.pipe = None
+                if hasattr(self, 'device') and isinstance(self.device, str) and self.device.startswith("cuda"):
+                    torch.cuda.empty_cache()
+                self.load_model_button.setText("Load Local Model")
+                self.status_label.setText("Local model unloaded due to mode change.")
+
+    def update_auto_paste_state(self, state):
+        """
+        Enable the auto-paste checkbox only if auto-copy is enabled.
+        If auto-copy is off, auto-paste is unchecked and disabled (grayed out).
+        """
+        if self.auto_copy.isChecked():
+            self.auto_paste.setEnabled(True)
+        else:
+            self.auto_paste.setChecked(False)
+            self.auto_paste.setEnabled(False)
+
+    def toggle_local_model(self):
+        """
+        Toggle the local Whisper model.
+        If the model is currently loaded, unload it (freeing resources, clearing GPU memory if applicable)
+        and update the button text to "Load Local Model". If no local model is loaded, load it and update the
+        button text to "Unload Local Model".
+        """
+        try:
+            if hasattr(self, 'pipe') and self.pipe is not None:
+                # Unload the local model
+                self.pipe = None
+                if hasattr(self, 'device') and isinstance(self.device, str) and self.device.startswith("cuda"):
+                    torch.cuda.empty_cache()
+                self.load_model_button.setText("Load Local Model")
+                self.status_label.setText("Local model unloaded.")
+            else:
+                # Load the local model
+                self.setup_transcription_model()
+                if hasattr(self, 'pipe') and self.pipe is not None:
+                    self.load_model_button.setText("Unload Local Model")
+        except Exception as e:
+            print(f"Error toggling local model: {e}")
+            self.status_label.setText("Error toggling local model.")
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
